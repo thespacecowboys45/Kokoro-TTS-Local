@@ -164,9 +164,89 @@ def translate(text: str, source: str, dest: str) -> str:
     except Exception as e:
         raise TranslationError(f"Translation failed: {type(e).__name__}: {e}") from e
 
+    if dest == "Japanese":
+        translated = [_end_japanese_sentence(ja, en) for ja, en in zip(translated, sentences)]
+
     out_lines = []
     index = 0
     for count in layout:
         out_lines.append("".join(translated[index:index + count]))
+        index += count
+    return "\n".join(out_lines)
+
+
+_JA_SENTENCE_END = re.compile(r"[。！？!?…」』）)]$")
+_JA_TERMINATORS = {"?": "？", "!": "！", ".": "。"}
+
+
+def _end_japanese_sentence(japanese: str, source_sentence: str) -> str:
+    """Restore a sentence end the model dropped, so joined sentences stay
+    visibly separate (e.g. a deliberately repeated sentence)."""
+    japanese = japanese.rstrip()
+    terminator = _JA_TERMINATORS.get(source_sentence.rstrip()[-1:])
+    if terminator and japanese and not _JA_SENTENCE_END.search(japanese):
+        return japanese + terminator
+    return japanese
+
+
+# Back-translation (translation review). Kept out of SUPPORTED_PAIRS so the
+# Source/Destination dropdowns, which are derived from it, do not change.
+BACK_TRANSLATION_PAIRS: Dict[Tuple[str, str], str] = {
+    ("Japanese", "English"): "staka/fugumt-ja-en",
+}
+
+# Japanese ends sentences with 。！？ and no following space.
+_JA_SENTENCE_SPLIT = re.compile(r"(?<=[。！？!?])\s*")
+
+
+def _split_sentences(line: str, lang: str):
+    pattern = _JA_SENTENCE_SPLIT if lang == "Japanese" else _SENTENCE_SPLIT
+    return [p for p in pattern.split(line.strip()) if p]
+
+
+def is_back_model_loaded(source: str = "Japanese", dest: str = "English") -> bool:
+    return BACK_TRANSLATION_PAIRS.get((source, dest)) in _models
+
+
+def is_back_model_downloaded(source: str = "Japanese", dest: str = "English") -> bool:
+    repo_id = BACK_TRANSLATION_PAIRS.get((source, dest))
+    return bool(repo_id) and _has_model_files(get_translation_model_dir(repo_id))
+
+
+def back_translate(text: str, source: str = "Japanese", dest: str = "English") -> str:
+    """Translate the target text back into the source language, line by line.
+
+    Only the text itself is an input: the original source is never passed, so
+    the result cannot be biased toward reproducing it.
+    """
+    if not text or not text.strip():
+        raise TranslationError("There is no text to back-translate.")
+    if len(text) > MAX_TRANSLATE_CHARS:
+        raise TranslationError(
+            f"Text is {len(text)} characters; the back-translation limit is "
+            f"{MAX_TRANSLATE_CHARS}."
+        )
+    repo_id = BACK_TRANSLATION_PAIRS.get((source, dest))
+    if repo_id is None:
+        raise TranslationError(f"Back-translation from {source} to {dest} is not supported.")
+
+    tokenizer, model, device = _load(repo_id)
+
+    layout = []
+    sentences = []
+    for line in text.split("\n"):
+        parts = _split_sentences(line, source)
+        layout.append(len(parts))
+        sentences.extend(parts)
+
+    try:
+        translated = _translate_sentences(sentences, tokenizer, model, device) if sentences else []
+    except Exception as e:
+        raise TranslationError(f"Back-translation failed: {type(e).__name__}: {e}") from e
+
+    out_lines = []
+    index = 0
+    for count in layout:
+        out_lines.append(" ".join(translated[index:index + count]))
         index += count
     return "\n".join(out_lines)

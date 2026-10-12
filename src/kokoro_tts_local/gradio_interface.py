@@ -44,6 +44,7 @@ from .models import (
 )
 from . import speed_dial
 from . import translation
+from . import translation_review
 
 # Constants
 MAX_TEXT_LENGTH = 5000
@@ -385,73 +386,62 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
     with gr.Blocks(title="Kokoro TTS Generator", fill_height=True) as interface:
         gr.Markdown("# Kokoro TTS Generator")
 
-        with gr.Row():
-            with gr.Column(scale=2):
-                gr.Markdown("## TTS Controls")
+        # Part A: direct text to speech. Built-in panel containers only (no
+        # tabs, no custom CSS) so the default theme's look is preserved.
+        with gr.Column(variant="panel"):
+            gr.Markdown("## A. Text to Speech\n"
+                        "Type English text, pick a voice, and generate speech directly.")
 
-            with gr.Column(scale=1):
-                gr.Markdown("## Speed Dial")
-
-        with gr.Row(equal_height=True):
-            with gr.Column(scale=2):
-                # Main TTS controls
-
-                voice = gr.Dropdown(
-                    choices=voices,
-                    value=voices[0] if voices else None,
-                    label="Voice"
-                )
-                text = gr.Textbox(
-                    lines=3,
-                    placeholder="Enter text to convert to speech...",
-                    label="Text"
-                )
-
-            with gr.Column(scale=1):
-                # Speed dial section
-                preset_dropdown = gr.Dropdown(
-                    choices=preset_names,
-                    value=preset_names[0] if preset_names else None,
-                    label="Saved Presets",
-                    interactive=True
-                )
-                preset_name = gr.Textbox(
-                    placeholder="Enter preset name...",
-                    label="New Preset Name"
-                )
-
-        with gr.Row(equal_height=True):
-            with gr.Column(scale=2):
-                with gr.Row():
-                    format = gr.Radio(
-                        choices=["wav", "mp3", "aac"],
-                        value="wav",
-                        label="Output Format"
+            with gr.Row():
+                with gr.Column(scale=2):
+                    # Main TTS controls
+                    voice = gr.Dropdown(
+                        choices=voices,
+                        value=voices[0] if voices else None,
+                        label="Voice"
                     )
-                    speed = gr.Slider(
-                        minimum=0.1,
-                        maximum=3.0,
-                        value=1.0,
-                        step=0.1,
-                        label="Speed"
+                    text = gr.Textbox(
+                        lines=3,
+                        placeholder="Enter text to convert to speech...",
+                        label="Text"
                     )
+                    with gr.Row():
+                        format = gr.Radio(
+                            choices=["wav", "mp3", "aac"],
+                            value="wav",
+                            label="Output Format"
+                        )
+                        speed = gr.Slider(
+                            minimum=0.1,
+                            maximum=3.0,
+                            value=1.0,
+                            step=0.1,
+                            label="Speed"
+                        )
+                    generate = gr.Button("Generate Speech", variant="primary")
 
-            with gr.Column(scale=1):
-                load_preset = gr.Button("Load")
-                save_preset = gr.Button("Save Current")
+                with gr.Column(scale=1):
+                    # Speed dial section
+                    gr.Markdown("### Speed Dial\n"
+                                "Save and reload voice, text, format and speed.")
+                    preset_dropdown = gr.Dropdown(
+                        choices=preset_names,
+                        value=preset_names[0] if preset_names else None,
+                        label="Saved Presets",
+                        interactive=True
+                    )
+                    preset_name = gr.Textbox(
+                        placeholder="Enter preset name...",
+                        label="New Preset Name"
+                    )
+                    with gr.Row():
+                        load_preset = gr.Button("Load")
+                        save_preset = gr.Button("Save Current")
+                        delete_preset = gr.Button("Delete")
 
-        with gr.Row():
-            with gr.Column(scale=2):
-                generate = gr.Button("Generate Speech")
-
-            with gr.Column(scale=1):
-                delete_preset = gr.Button("Delete")
-
-        with gr.Row():
             # Output section
             output = gr.Audio(label="Generated Audio")
 
-        with gr.Row():
             # Every handler reports here. Without it the only failure signal
             # was an empty audio player, identical for empty input, a missing
             # voice file, absent ffmpeg and CUDA OOM.
@@ -462,7 +452,7 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
                 interactive=False
             )
 
-        # Translation section. It has its own player and status box so the
+        # Part B: translation. It has its own player and status box so the
         # direct TTS workflow above is never written to by these handlers.
         default_dest = translation.DEST_LANGUAGES[0]
         translation_voices = [
@@ -470,47 +460,105 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
             if get_language_code_from_voice(v) == translation.DEST_LANGUAGE_CODES[default_dest]
         ]
 
-        gr.Markdown("## Translate & Speak")
+        with gr.Column(variant="panel"):
+            gr.Markdown("## B. Translation\n"
+                        "Translate English into Japanese, review and edit the result, "
+                        "then speak it with a Japanese voice.")
 
-        with gr.Row():
-            source_lang = gr.Dropdown(
-                choices=translation.SOURCE_LANGUAGES,
-                value=translation.SOURCE_LANGUAGES[0],
-                label="Source Language",
+            gr.Markdown("### 1. Source")
+            with gr.Row():
+                source_lang = gr.Dropdown(
+                    choices=translation.SOURCE_LANGUAGES,
+                    value=translation.SOURCE_LANGUAGES[0],
+                    label="Source Language",
+                    interactive=True
+                )
+                dest_lang = gr.Dropdown(
+                    choices=translation.DEST_LANGUAGES,
+                    value=default_dest,
+                    label="Destination Language",
+                    interactive=True
+                )
+            source_text = gr.Textbox(
+                lines=3,
+                placeholder="Enter text to translate...",
+                label="Source Text"
+            )
+            with gr.Row():
+                review_context = gr.Textbox(
+                    lines=2,
+                    label="Context (optional, used by Translate and Review)",
+                    placeholder="Audience, intended meaning, tone, pronunciation, terminology"
+                )
+                review_glossary = gr.Textbox(
+                    lines=2,
+                    label="Glossary (optional, used by Translate and Review)",
+                    placeholder="One per line: English term = 日本語訳  (e.g. lawn = 芝生)"
+                )
+
+            gr.Markdown("### 2. Translate\n"
+                        "**Translate** is quick and plain. **Translate and Review** follows "
+                        "the context and glossary, back-translates, and reviews the result "
+                        "(needs Ollama running).")
+            with gr.Row():
+                translate_btn = gr.Button("Translate")
+                translate_review_btn = gr.Button("Translate and Review", variant="primary")
+
+            gr.Markdown("### 3. Review and edit the Japanese")
+            translated_text = gr.Textbox(
+                lines=3,
+                placeholder="Translated text appears here. Review or edit it before generating speech.",
+                label="Translated Text",
                 interactive=True
             )
-            dest_lang = gr.Dropdown(
-                choices=translation.DEST_LANGUAGES,
-                value=default_dest,
-                label="Destination Language",
-                interactive=True
+            recheck_btn = gr.Button("Recheck Edited Translation")
+            gr.Markdown("*Back-translation is a diagnostic, not a certification.*")
+            # Translation review: English → Japanese → independent English
+            # back-translation, review findings, and at most two automatic
+            # revision passes shown beside (never over) the editable Japanese.
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("#### Review of the Japanese above (unrevised)")
+                    back_translation_box = gr.Textbox(
+                        label="English Back-translation", lines=3, interactive=False
+                    )
+                    review_findings_md = gr.Markdown()
+                with gr.Column():
+                    gr.Markdown("#### Revised candidate")
+                    candidate_text = gr.Textbox(
+                        label="Revised Japanese (candidate)", lines=3, interactive=False
+                    )
+                    candidate_back = gr.Textbox(
+                        label="Back-translation of the candidate", lines=3, interactive=False
+                    )
+                    candidate_findings_md = gr.Markdown()
+                    use_revised_btn = gr.Button("Use revised version")
+            with gr.Accordion("Previous translations", open=False):
+                history_md = gr.Markdown("None yet.")
+
+            gr.Markdown("### 4. Speak the translation\n"
+                        "Uses the Output Format and Speed set in part A.")
+            with gr.Row(equal_height=True):
+                translation_voice = gr.Dropdown(
+                    choices=translation_voices,
+                    value=translation_voices[0] if translation_voices else None,
+                    label="Translation Voice",
+                    scale=2
+                )
+                speak_translation_btn = gr.Button(
+                    "Generate Speech from Translation", variant="primary", scale=1
+                )
+            translated_output = gr.Audio(label="Translated Audio")
+            translation_status = gr.Textbox(
+                label="Translation Status",
+                value="Ready.",
+                lines=3,
+                interactive=False
             )
 
-        source_text = gr.Textbox(
-            lines=3,
-            placeholder="Enter text to translate...",
-            label="Source Text"
-        )
-        translate_btn = gr.Button("Translate")
-        translated_text = gr.Textbox(
-            lines=3,
-            placeholder="Translated text appears here. Review or edit it before generating speech.",
-            label="Translated Text",
-            interactive=True
-        )
-        translation_voice = gr.Dropdown(
-            choices=translation_voices,
-            value=translation_voices[0] if translation_voices else None,
-            label="Translation Voice"
-        )
-        speak_translation_btn = gr.Button("Generate Speech from Translation")
-        translated_output = gr.Audio(label="Translated Audio")
-        translation_status = gr.Textbox(
-            label="Translation Status",
-            value="Ready.",
-            lines=3,
-            interactive=False
-        )
+        # The inputs and displays of the current review, for stale detection.
+        review_state = gr.State(None)
+        history_state = gr.State([])
 
         # Generator so the first, slow model load is announced before it starts.
         def translate_fn(text, source, dest):
@@ -547,6 +595,155 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
             if not text or not text.strip():
                 return None, "Translate some text (or type it) before generating speech."
             return generate_tts_with_logs(voice_name, text, format, speed)
+
+        stale_text = "STALE: the text changed after this review. Click Recheck Edited Translation."
+
+        def _review_displays(result, ambiguities_md):
+            unrevised = result["unrevised"]
+            candidate = result["candidate"]
+            findings = translation_review.format_assessment_md(unrevised)
+            if ambiguities_md:
+                findings = f"{ambiguities_md}\n\n{findings}"
+            final = candidate["final"] if candidate else None
+            return {
+                "back": unrevised["back"],
+                "findings": findings,
+                "candidate_text": final["japanese"] if final else "",
+                "candidate_back": final["back"] if final else "",
+                "candidate_findings": translation_review.format_candidate_md(candidate),
+            }
+
+        def _review_status(result):
+            meaning = sum(1 for f in result["unrevised"]["findings"] if f["kind"] == "meaning")
+            candidate = result["candidate"]
+            passes = len(candidate["passes"]) if candidate else 0
+            unresolved = len(candidate["unresolved"]) if candidate else 0
+            return (f"Review done (diagnostic only). Meaning findings in the unrevised "
+                    f"Japanese: {meaning}. Revision passes: {passes} of max "
+                    f"{translation_review.MAX_REVISION_PASSES}. Unresolved: {unresolved}.")
+
+        def _run_review_events(source, japanese, context, glossary):
+            """Yield ('progress', msg) then ('result', result) from the review core."""
+            if not translation.is_back_model_loaded():
+                yield "progress", ("Loading back-translation model..."
+                                   if translation.is_back_model_downloaded()
+                                   else "Downloading back-translation model (first use only)...")
+            yield from translation_review.run_review(source, japanese, context, glossary)
+
+        def _stale_displays(state):
+            displays = state["displays"]
+            return (f"[{stale_text}]\n\n{displays['back']}",
+                    f"**⚠ {stale_text}**\n\n{displays['findings']}",
+                    f"[{stale_text}]\n\n{displays['candidate_back']}",
+                    f"**⚠ {stale_text}**\n\n{displays['candidate_findings']}")
+
+        # Writes nothing until the whole run succeeds, so a failure leaves
+        # every text box exactly as the user left it.
+        def translate_review_fn(source, context, glossary_text, state):
+            unchanged = (gr.update(),) * 6
+
+            def status(message):
+                return (*unchanged, message, gr.update())
+
+            try:
+                glossary = translation_review.parse_glossary(glossary_text)
+                if not source or not source.strip():
+                    raise translation_review.ReviewError("Enter English text to translate.")
+                yield status(f"Translating with context ({translation_review.REVIEW_MODEL})...")
+                translated = translation_review.translate_with_context(source, context, glossary)
+                japanese = translated["translation"]
+                result = None
+                for kind, payload in _run_review_events(source, japanese, context, glossary):
+                    if kind == "progress":
+                        yield status(payload)
+                    else:
+                        result = payload
+            except translation.TranslationError as e:
+                yield status(str(e))
+                return
+            except Exception as e:
+                yield status(f"Translate and Review failed: {type(e).__name__}: {e}")
+                return
+            ambiguities_md = translation_review.format_ambiguities_md(translated["ambiguities"])
+            displays = _review_displays(result, ambiguities_md)
+            new_state = {"source": source, "japanese": japanese, "context": context,
+                         "glossary": glossary_text, "stale": False,
+                         "ambiguities_md": ambiguities_md, "displays": displays}
+            yield (japanese, displays["back"], displays["findings"], displays["candidate_text"],
+                   displays["candidate_back"], displays["candidate_findings"],
+                   _review_status(result), new_state)
+
+        # Reviews the Japanese exactly as currently edited; never writes to it.
+        def recheck_fn(source, japanese, context, glossary_text, state):
+            unchanged = (gr.update(),) * 5
+
+            def status(message):
+                return (*unchanged, message, gr.update())
+
+            try:
+                glossary = translation_review.parse_glossary(glossary_text)
+                result = None
+                for kind, payload in _run_review_events(source, japanese, context, glossary):
+                    if kind == "progress":
+                        yield status(payload)
+                    else:
+                        result = payload
+            except translation.TranslationError as e:
+                yield status(str(e))
+                return
+            except Exception as e:
+                yield status(f"Recheck failed: {type(e).__name__}: {e}")
+                return
+            # Translator ambiguity notes describe the source, so keep them only
+            # while the source is unchanged.
+            ambiguities_md = (state or {}).get("ambiguities_md", "") \
+                if state and state.get("source") == source else ""
+            displays = _review_displays(result, ambiguities_md)
+            new_state = {"source": source, "japanese": japanese, "context": context,
+                         "glossary": glossary_text, "stale": False,
+                         "ambiguities_md": ambiguities_md, "displays": displays}
+            yield (displays["back"], displays["findings"], displays["candidate_text"],
+                   displays["candidate_back"], displays["candidate_findings"],
+                   _review_status(result), new_state)
+
+        # Fires only on user edits (.input), not on programmatic updates.
+        def mark_stale_fn(source, japanese, context, glossary_text, state):
+            unchanged = (gr.update(),) * 4
+            if not state or state["stale"]:
+                return (*unchanged, state)
+            snapshot = (state["source"], state["japanese"], state["context"], state["glossary"])
+            if (source, japanese, context, glossary_text) == snapshot:
+                return (*unchanged, state)
+            state = {**state, "stale": True}
+            return (*_stale_displays(state), state)
+
+        def _history_markdown(history):
+            if not history:
+                return "None yet."
+            return "\n".join(f"{i}. 「{entry}」" for i, entry in enumerate(history, start=1))
+
+        # The only way a revision enters the editable Japanese.
+        def use_revised_fn(candidate, current, history, state):
+            if not candidate or not candidate.strip():
+                return (gr.update(), history, gr.update(), *(gr.update(),) * 4,
+                        state, "There is no revised candidate to use.")
+            history = history + [current] if current and current.strip() else history
+            if state:
+                state = {**state, "stale": True}
+                stale = _stale_displays(state)
+            else:
+                stale = (gr.update(),) * 4
+            return (candidate, history, _history_markdown(history), *stale, state,
+                    "Revised candidate copied into the Japanese text. The previous "
+                    "version is under Previous translations. Recheck to review it.")
+
+        # Separate listener so the existing speech handler stays untouched; it
+        # writes to the findings panel, not the status box the speech result uses.
+        def speak_stale_reminder_fn(state):
+            if not state or not state["stale"]:
+                return gr.update()
+            return ("**⚠ Speech uses the current Japanese, which has not been reviewed "
+                    "since it changed.**\n\n" + _stale_displays(state)[1])
 
         # Function to load a preset. Returns gr.update() (leave unchanged)
         # rather than None on the error paths: None is not a valid Slider
@@ -634,6 +831,43 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
             fn=speak_translation_fn,
             inputs=[translation_voice, translated_text, dest_lang, format, speed],
             outputs=[translated_output, translation_status]
+        )
+
+        review_display_outputs = [back_translation_box, review_findings_md, candidate_text,
+                                  candidate_back, candidate_findings_md]
+
+        translate_review_btn.click(
+            fn=translate_review_fn,
+            inputs=[source_text, review_context, review_glossary, review_state],
+            outputs=[translated_text, *review_display_outputs, translation_status, review_state]
+        )
+
+        recheck_btn.click(
+            fn=recheck_fn,
+            inputs=[source_text, translated_text, review_context, review_glossary, review_state],
+            outputs=[*review_display_outputs, translation_status, review_state]
+        )
+
+        for edited in (translated_text, source_text, review_context, review_glossary):
+            edited.input(
+                fn=mark_stale_fn,
+                inputs=[source_text, translated_text, review_context, review_glossary, review_state],
+                outputs=[back_translation_box, review_findings_md, candidate_back,
+                         candidate_findings_md, review_state]
+            )
+
+        use_revised_btn.click(
+            fn=use_revised_fn,
+            inputs=[candidate_text, translated_text, history_state, review_state],
+            outputs=[translated_text, history_state, history_md, back_translation_box,
+                     review_findings_md, candidate_back, candidate_findings_md, review_state,
+                     translation_status]
+        )
+
+        speak_translation_btn.click(
+            fn=speak_stale_reminder_fn,
+            inputs=[review_state],
+            outputs=[review_findings_md]
         )
 
     # Bound the queue: gradio defaults to max_size=None (unlimited backlog)

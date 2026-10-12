@@ -25,7 +25,12 @@ import platform
 from datetime import datetime
 import uuid
 import ipaddress
+import math
+import queue
+import re
+import time
 import shutil
+import tempfile
 from pathlib import Path
 import soundfile as sf
 from pydub import AudioSegment
@@ -45,17 +50,25 @@ from .models import (
 from . import speed_dial
 from . import translation
 from . import translation_review
+from . import video_export
 
 # Constants
-MAX_TEXT_LENGTH = 5000
+# Size/resource limits: None means unlimited. This instance is deliberately
+# run without them (dxb, 2026-10-12: "think unlimited"; long jobs may take
+# hours and the machine may bog down). Upstream's values are noted so any
+# limit can be restored by setting a number again.
+MAX_TEXT_LENGTH = None        # upstream: 5000 characters
 DEFAULT_SAMPLE_RATE = 24000
 MIN_SPEED = 0.1
 MAX_SPEED = 3.0
 DEFAULT_SPEED = 1.0
 # Cost-envelope budget: synthesis cost scales with len(text) and inversely
-# with speed, so only a bound on their product keeps one legal request far
-# below hours of single-worker CPU.
-MAX_COST_CHARS = 5_000
+# with speed, so a bound on their product keeps one request from pinning the
+# single TTS worker for CPU-hours.
+MAX_COST_CHARS = None         # upstream: 5_000
+MAX_SEGMENTS = None           # upstream: 100 segments per request
+MAX_AUDIO_SECONDS = None      # upstream: 600 s of output audio
+LOW_MEMORY_TEXT_CAP = None    # upstream: 2000 characters when < 2 GB RAM free
 
 # Define path type for consistent handling
 PathLike = Union[str, Path]
@@ -75,13 +88,15 @@ DEFAULT_OUTPUT_DIR = get_base_dir() / "outputs"    # Directory for generated aud
 SAMPLE_RATE = validate_sample_rate(24000)  # Validated sample rate
 
 # Retention budget for the outputs dir: nothing else in the package ever
-# reclaims generated files, so every served request would otherwise
-# permanently consume the KOKORO_BASE_DIR volume (and the host disk).
-MAX_OUTPUTS_DIR_BYTES = 2 * 1024 ** 3
+# reclaims generated files, so with a budget set the oldest are deleted.
+# None keeps every generated file (unlimited; upstream: 2 GiB).
+MAX_OUTPUTS_DIR_BYTES = None
 
 
-def enforce_output_retention(budget_bytes: int = MAX_OUTPUTS_DIR_BYTES) -> None:
+def enforce_output_retention(budget_bytes: Optional[int] = MAX_OUTPUTS_DIR_BYTES) -> None:
     """Delete oldest generated files until the outputs dir fits its budget."""
+    if budget_bytes is None:
+        return
     files = sorted(
         (p for p in DEFAULT_OUTPUT_DIR.glob("tts_*.*") if p.is_file()),
         key=lambda p: p.stat().st_mtime,
@@ -203,10 +218,9 @@ def generate_tts_with_logs(
         available_gb = memory.available / (1024**3)
 
         if available_gb < 1.0:  # Less than 1GB available
-            message = (f"Low memory available ({available_gb:.1f}GB). "
-                       "Consider closing other applications.")
-            print(f"Warning: {message}")
-            notes.append(message)
+            # Console only: with no limits, low memory just means slower.
+            print(f"Warning: Low memory available ({available_gb:.1f}GB); "
+                  "continuing without limits, this may be slow.")
             # Force garbage collection
             gc.collect()
             if torch.cuda.is_available():
@@ -235,23 +249,23 @@ def generate_tts_with_logs(
 
         # Dynamic text length limit based on available memory
         MAX_CHARS = MAX_TEXT_LENGTH
-        if available_gb < 2.0:  # Less than 2GB available
-            MAX_CHARS = min(MAX_CHARS, 2000)  # Reduce limit for low memory
+        if available_gb < 2.0 and LOW_MEMORY_TEXT_CAP is not None:
+            MAX_CHARS = min(MAX_CHARS or LOW_MEMORY_TEXT_CAP, LOW_MEMORY_TEXT_CAP)
             message = f"Reduced text limit to {MAX_CHARS} characters due to low memory"
             print(message)
             notes.append(message)
 
-        if len(text) > MAX_CHARS:
+        if MAX_CHARS is not None and len(text) > MAX_CHARS:
             message = (f"Text exceeded {MAX_CHARS} characters and was truncated; "
                        "only the beginning was synthesized.")
             print(f"Warning: {message}")
             notes.append(message)
             text = text[:MAX_CHARS] + "..."
 
-        # Synthesis cost is driven by len(text)/speed; without a budget on
-        # the product, a single legal request (5000 chars at speed 0.1) pins
-        # the only TTS worker for CPU-hours.
-        if len(text) / speed > MAX_COST_CHARS:
+        # Synthesis cost is driven by len(text)/speed; with a budget set, it
+        # stops a single request (5000 chars at speed 0.1) pinning the only
+        # TTS worker for CPU-hours.
+        if MAX_COST_CHARS is not None and len(text) / speed > MAX_COST_CHARS:
             raise ValueError(
                 f"Request too heavy: len(text)/speed must be "
                 f"<= {MAX_COST_CHARS}; shorten the text or raise the speed"
@@ -278,12 +292,12 @@ def generate_tts_with_logs(
             pipeline = get_pipeline_for_voice(voice_name)
 
             all_audio = []
-            max_segments = 100  # Safety limit for very long texts
-            # Bound retained audio directly: per-parameter limits (chars,
-            # speed) multiply with G2P digit expansion (~8x prose density),
-            # so only a cap on total output audio bounds memory. 600 s at
-            # 24 kHz float32 is ~58 MB aggregate.
-            max_samples = 600 * SAMPLE_RATE
+            max_segments = MAX_SEGMENTS  # None = unlimited
+            # With a cap set, retained audio is bounded directly: per-parameter
+            # limits (chars, speed) multiply with G2P digit expansion (~8x prose
+            # density). 600 s at 24 kHz float32 is ~58 MB aggregate; unlimited
+            # grows by about that much per 10 minutes of speech.
+            max_samples = None if MAX_AUDIO_SECONDS is None else MAX_AUDIO_SECONDS * SAMPLE_RATE
             total_samples = 0
             segment_count = 0
 
@@ -291,12 +305,19 @@ def generate_tts_with_logs(
             # it must not outlive this loop: hitting max_segments would
             # otherwise hold the lock through file writing and conversion, and
             # block shutdown, which drains by acquiring every family lock.
+            # Non-English text is pre-split into sentence-sized chunks; see
+            # _speech_chunks for why Kokoro's own splitting is not enough.
+            chunks = _speech_chunks(text, voice_name)
+            truncated_segments = 0
             with closing(pipeline.iter_speech(
-                text, voice=str(voice_path), speed=speed, split_pattern=r'\n+'
+                chunks if chunks is not None else text,
+                voice=str(voice_path), speed=speed, split_pattern=r'\n+'
             )) as generator:
                 for gs, ps, audio in generator:
                     segment_count += 1
-                    if segment_count > max_segments:
+                    if ps and len(ps) >= KOKORO_MAX_PHONEMES:
+                        truncated_segments += 1
+                    if max_segments is not None and segment_count > max_segments:
                         message = (f"Reached the {max_segments}-segment limit; "
                                    "the audio is truncated.")
                         print(f"Warning: {message}")
@@ -308,7 +329,7 @@ def generate_tts_with_logs(
                             audio = torch.from_numpy(audio).float()
                         total_samples += audio.numel()
                         all_audio.append(audio)
-                        if total_samples > max_samples:
+                        if max_samples is not None and total_samples > max_samples:
                             message = ("Reached the total audio-length limit; "
                                        "the audio is truncated.")
                             print(f"Warning: {message}")
@@ -317,6 +338,13 @@ def generate_tts_with_logs(
                         print(f"Generated segment: {gs}")
                         if ps:  # Only print phonemes if available
                             print(f"Phonemes: {ps}")
+
+            if truncated_segments:
+                message = (f"{truncated_segments} segment(s) reached Kokoro's "
+                           f"{KOKORO_MAX_PHONEMES}-phoneme limit and were cut short; "
+                           "some text was not spoken. Split long sentences.")
+                print(f"Warning: {message}")
+                notes.append(message)
 
             if not all_audio:
                 raise Exception("No audio generated")
@@ -369,6 +397,125 @@ def generate_tts_with_logs(
 def _status(headline: str, notes: List[str]) -> str:
     """Join a headline with any warnings collected during the request."""
     return "\n".join([headline] + [f"- {note}" for note in notes])
+
+
+# Kokoro's model accepts at most this many phonemes per segment and silently
+# cuts anything longer.
+KOKORO_MAX_PHONEMES = 510
+# Characters per non-English chunk. Japanese runs ~3 phonemes per character,
+# so 150 characters stays well under the 510-phoneme limit.
+MAX_CHUNK_CHARS = 150
+_SENTENCE_END = re.compile(r"(?<=[。！？!?.…])\s*")
+_CLAUSE_END = re.compile(r"(?<=[、，,;；:：])\s*")
+
+
+def _speech_chunks(text: str, voice_name: str) -> Optional[List[str]]:
+    """Pre-split non-English text into chunks Kokoro can speak in full.
+
+    Kokoro chunks non-English text only at ASCII . ! ? and in 400-character
+    blocks, so a Japanese paragraph (。！？) becomes one chunk that is cut at
+    510 phonemes (~29 s). English uses Kokoro's own chunker: returns None.
+    """
+    if get_language_code_from_voice(voice_name) in ("a", "b"):
+        return None
+    chunks = []
+    for line in text.split("\n"):
+        for sentence in (s for s in _SENTENCE_END.split(line.strip()) if s.strip()):
+            if len(sentence) <= MAX_CHUNK_CHARS:
+                chunks.append(sentence)
+                continue
+            current = ""
+            for clause in (c for c in _CLAUSE_END.split(sentence) if c):
+                if current and len(current) + len(clause) > MAX_CHUNK_CHARS:
+                    chunks.append(current)
+                    current = ""
+                current += clause
+                while len(current) > MAX_CHUNK_CHARS:  # no clause breaks at all
+                    chunks.append(current[:MAX_CHUNK_CHARS])
+                    current = current[MAX_CHUNK_CHARS:]
+            if current:
+                chunks.append(current)
+    # A punctuation-only fragment has nothing to speak: attach it to the previous chunk.
+    merged = []
+    for chunk in chunks:
+        if not re.search(r"\w", chunk) and merged:
+            merged[-1] += chunk
+        else:
+            merged.append(chunk)
+    return merged
+
+
+def synthesize_sentences(voice_name: str, text: str, speed: float):
+    """Synthesise text one sentence at a time for video subtitle timing.
+
+    Applies the same limits as generate_tts_with_logs. Returns
+    (clips, spans, sentences): each clip trimmed to its speech, and each span
+    (onset, offset, clip_length) in seconds within its own clip.
+    """
+    if not text or not text.strip():
+        raise ValueError("Text input cannot be empty")
+    try:
+        speed = float(speed)
+    except (TypeError, ValueError):
+        raise ValueError(f"Speed must be a number, got {speed!r}")
+    if not (MIN_SPEED <= speed <= MAX_SPEED):
+        raise ValueError(f"Speed must be between {MIN_SPEED} and {MAX_SPEED}, got {speed}")
+    if MAX_TEXT_LENGTH is not None and len(text) > MAX_TEXT_LENGTH:
+        raise ValueError(f"Text is {len(text)} characters; the limit is {MAX_TEXT_LENGTH}.")
+    if MAX_COST_CHARS is not None and len(text) / speed > MAX_COST_CHARS:
+        raise ValueError(f"Request too heavy: len(text)/speed must be <= {MAX_COST_CHARS}; "
+                         "shorten the text or raise the speed")
+
+    voice_path = get_safe_voice_path(voice_name)
+    if not voice_path.exists():
+        raise FileNotFoundError(f"Voice file not found: {voice_path}")
+    lang = "Japanese" if get_language_code_from_voice(voice_name) == "j" else "English"
+    sentences = []
+    for line in text.split("\n"):
+        for piece in translation._split_sentences(line, lang):
+            # A punctuation-only fragment ("。" from "。。", "！？") has nothing
+            # to speak: attach it to the previous sentence instead.
+            if not re.search(r"\w", piece):
+                if sentences:
+                    sentences[-1] += piece
+                continue
+            sentences.append(piece)
+    if not sentences:
+        raise ValueError("The text has nothing speakable in it.")
+
+    pipeline = get_pipeline_for_voice(voice_name)
+    max_samples = None if MAX_AUDIO_SECONDS is None else MAX_AUDIO_SECONDS * SAMPLE_RATE
+    total_samples = 0
+    clips, spans = [], []
+    for sentence in sentences:
+        chunks = []
+        pieces = _speech_chunks(sentence, voice_name)
+        # Closed before the next sentence so the model-family lock is released.
+        with closing(pipeline.iter_speech(
+            pieces if pieces is not None else sentence,
+            voice=str(voice_path), speed=speed, split_pattern=r'\n+'
+        )) as generator:
+            for _, ps, audio in generator:
+                if ps and len(ps) >= KOKORO_MAX_PHONEMES:
+                    # A cut-short sentence would desynchronise the subtitles.
+                    raise ValueError(
+                        f"A sentence reached Kokoro's {KOKORO_MAX_PHONEMES}-phoneme limit and "
+                        f"would be cut short: {sentence[:40]!r}... Split it into shorter sentences.")
+                if audio is None:
+                    continue
+                if isinstance(audio, torch.Tensor):
+                    audio = audio.detach().cpu().numpy()
+                chunks.append(np.asarray(audio, dtype=np.float32))
+        if not chunks:
+            raise RuntimeError(f"No audio generated for: {sentence!r}")
+        clip, onset, offset = video_export.trim_silence(np.concatenate(chunks), SAMPLE_RATE)
+        total_samples += len(clip)
+        if max_samples is not None and total_samples > max_samples:
+            raise ValueError(f"The speech would exceed the {MAX_AUDIO_SECONDS} s audio limit; "
+                             "shorten the text.")
+        clips.append(clip)
+        spans.append((onset, offset, len(clip) / SAMPLE_RATE))
+    return clips, spans, sentences
 
 def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
     """Create and launch the Gradio interface."""
@@ -512,6 +659,8 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
                 interactive=True
             )
             recheck_btn = gr.Button("Recheck Edited Translation")
+            # Live, ticking progress for Translate and Review / Recheck.
+            review_progress_md = gr.Markdown("")
             gr.Markdown("*Back-translation is a diagnostic, not a certification.*")
             # Translation review: English → Japanese → independent English
             # back-translation, review findings, and at most two automatic
@@ -538,6 +687,9 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
 
             gr.Markdown("### 4. Speak the translation\n"
                         "Uses the Output Format and Speed set in part A.")
+            # Which version of the Japanese will be spoken (plain, unrevised,
+            # revised, or the user's edit); kept current as the text changes.
+            speech_source_md = gr.Markdown("**Will speak:** nothing yet. Translate first.")
             with gr.Row(equal_height=True):
                 translation_voice = gr.Dropdown(
                     choices=translation_voices,
@@ -556,9 +708,58 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
                 interactive=False
             )
 
+        # Part C: video. A still picture, the Japanese speech from part B, and
+        # the English source text as burned-in subtitles timed to the speech.
+        with gr.Column(variant="panel"):
+            gr.Markdown("## C. Video\n"
+                        "Uses the Japanese text and voice from part B (with the Speed from "
+                        "part A), and the English source text as subtitles.")
+            video_source_md = gr.Markdown("**Video will speak:** nothing yet. Translate first.")
+            with gr.Row():
+                with gr.Column(scale=2):
+                    # image_mode="RGB": gradio re-saves each upload under its
+                    # original extension, and its default RGBA mode cannot be
+                    # written as JPEG, so every .jpg photo would fail. format
+                    # only applies to unnamed blobs such as the composite.
+                    video_picture = gr.ImageEditor(
+                        type="filepath",
+                        image_mode="RGB",
+                        format="png",
+                        sources=["upload", "clipboard"],
+                        transforms=("crop",),
+                        brush=False,
+                        eraser=False,
+                        layers=False,
+                        label="Background picture (drag to crop)"
+                    )
+                with gr.Column(scale=1):
+                    video_size = gr.Dropdown(
+                        choices=list(video_export.FRAME_SIZES),
+                        value=list(video_export.FRAME_SIZES)[0],
+                        label="Video Size"
+                    )
+                    video_fit = gr.Radio(
+                        choices=video_export.FIT_MODES,
+                        value=video_export.FIT_MODES[0],
+                        label="Picture Fit"
+                    )
+                    preview_btn = gr.Button("Preview Frame")
+                    create_video_btn = gr.Button("Create Video", variant="primary")
+            with gr.Row():
+                video_preview = gr.Image(label="Frame Preview", interactive=False)
+                video_output = gr.Video(label="Video")
+            video_status = gr.Textbox(
+                label="Video Status",
+                value="Ready.",
+                lines=3,
+                interactive=False
+            )
+
         # The inputs and displays of the current review, for stale detection.
         review_state = gr.State(None)
         history_state = gr.State([])
+        # Where the Japanese in the editable box came from.
+        speech_origin = gr.State("")
 
         # Generator so the first, slow model load is announced before it starts.
         def translate_fn(text, source, dest):
@@ -630,6 +831,58 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
                                    else "Downloading back-translation model (first use only)...")
             yield from translation_review.run_review(source, japanese, context, glossary)
 
+        def _progress_line(title, stage, fraction, elapsed, frame):
+            cells = 24
+            filled = int(fraction * cells)
+            bar = "█" * filled + "░" * (cells - filled)
+            spinner = "◐◓◑◒"[frame % 4]
+            return (f"**{spinner} {title}** — {stage}  \n"
+                    f"`{bar}` {int(fraction * 100)}% · {elapsed:.0f} s elapsed (estimated)")
+
+        def _ticking(work, title, progress, tick_seconds=0.5, creep_seconds=15.0):
+            """Run a ('progress', msg)/(kind, payload) event generator in a
+            thread, yielding (kind, payload, progress_markdown) and a "tick"
+            every tick_seconds, so the page keeps moving while a model call
+            blocks.
+
+            Progress is an estimate: each new stage takes half of the remaining
+            distance to 95%, and creeps toward its ceiling while it runs. It only
+            reaches 100% when the work actually finishes.
+            """
+            events = queue.Queue()
+
+            def runner():
+                try:
+                    for event in work():
+                        events.put(event)
+                    events.put(("_done", None))
+                except Exception as e:  # re-raised in the handler's thread
+                    events.put(("_error", e))
+
+            threading.Thread(target=runner, daemon=True).start()
+            start = stage_start = time.time()
+            low, high, stage, frame = 0.0, 0.5, "starting...", 0
+            while True:
+                try:
+                    kind, payload = events.get(timeout=tick_seconds)
+                except queue.Empty:
+                    kind, payload = "tick", None
+                now = time.time()
+                if kind == "progress":
+                    low = low + (high - low) * (1 - math.exp(-(now - stage_start) / creep_seconds))
+                    high = low + (0.95 - low) * 0.5
+                    stage, stage_start = payload, now
+                if kind == "_error":
+                    raise payload
+                if kind == "_done":
+                    progress(1.0, desc="Done")
+                    yield "done", None, f"**✓ {title}** — finished in {now - start:.0f} s."
+                    return
+                frame += 1
+                fraction = low + (high - low) * (1 - math.exp(-(now - stage_start) / creep_seconds))
+                progress(fraction, desc=stage)
+                yield kind, payload, _progress_line(title, stage, fraction, now - start, frame)
+
         def _stale_displays(state):
             displays = state["displays"]
             return (f"[{stale_text}]\n\n{displays['back']}",
@@ -639,30 +892,43 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
 
         # Writes nothing until the whole run succeeds, so a failure leaves
         # every text box exactly as the user left it.
-        def translate_review_fn(source, context, glossary_text, state):
+        def translate_review_fn(source, context, glossary_text, state, progress=gr.Progress()):
             unchanged = (gr.update(),) * 6
+            started = time.time()
 
-            def status(message):
-                return (*unchanged, message, gr.update())
+            def status(message, bar=gr.update()):
+                return (*unchanged, message, gr.update(), bar)
 
             try:
                 glossary = translation_review.parse_glossary(glossary_text)
                 if not source or not source.strip():
                     raise translation_review.ReviewError("Enter English text to translate.")
-                yield status(f"Translating with context ({translation_review.REVIEW_MODEL})...")
-                translated = translation_review.translate_with_context(source, context, glossary)
-                japanese = translated["translation"]
-                result = None
-                for kind, payload in _run_review_events(source, japanese, context, glossary):
+
+                def work():
+                    yield "progress", f"Translating with context ({translation_review.REVIEW_MODEL})..."
+                    done = translation_review.translate_with_context(source, context, glossary)
+                    yield "translated", done
+                    yield from _run_review_events(source, done["translation"], context, glossary)
+
+                translated = result = None
+                for kind, payload, bar in _ticking(work, "Translating and reviewing", progress):
                     if kind == "progress":
-                        yield status(payload)
-                    else:
+                        yield status(payload, bar)
+                    elif kind in ("tick", "done"):
+                        yield status(gr.update(), bar)
+                    elif kind == "translated":
+                        translated = payload
+                    elif kind == "result":
                         result = payload
+                japanese = translated["translation"]
             except translation.TranslationError as e:
-                yield status(str(e))
+                yield status(str(e), f"**✗ Translating and reviewing** — stopped after "
+                                     f"{time.time() - started:.0f} s.")
                 return
             except Exception as e:
-                yield status(f"Translate and Review failed: {type(e).__name__}: {e}")
+                yield status(f"Translate and Review failed: {type(e).__name__}: {e}",
+                             f"**✗ Translating and reviewing** — stopped after "
+                             f"{time.time() - started:.0f} s.")
                 return
             ambiguities_md = translation_review.format_ambiguities_md(translated["ambiguities"])
             displays = _review_displays(result, ambiguities_md)
@@ -671,28 +937,38 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
                          "ambiguities_md": ambiguities_md, "displays": displays}
             yield (japanese, displays["back"], displays["findings"], displays["candidate_text"],
                    displays["candidate_back"], displays["candidate_findings"],
-                   _review_status(result), new_state)
+                   _review_status(result), new_state, gr.update())
 
         # Reviews the Japanese exactly as currently edited; never writes to it.
-        def recheck_fn(source, japanese, context, glossary_text, state):
+        def recheck_fn(source, japanese, context, glossary_text, state, progress=gr.Progress()):
             unchanged = (gr.update(),) * 5
+            started = time.time()
 
-            def status(message):
-                return (*unchanged, message, gr.update())
+            def status(message, bar=gr.update()):
+                return (*unchanged, message, gr.update(), bar)
 
             try:
                 glossary = translation_review.parse_glossary(glossary_text)
+
+                def work():
+                    yield from _run_review_events(source, japanese, context, glossary)
+
                 result = None
-                for kind, payload in _run_review_events(source, japanese, context, glossary):
+                for kind, payload, bar in _ticking(work, "Rechecking the edited translation",
+                                                   progress):
                     if kind == "progress":
-                        yield status(payload)
-                    else:
+                        yield status(payload, bar)
+                    elif kind in ("tick", "done"):
+                        yield status(gr.update(), bar)
+                    elif kind == "result":
                         result = payload
             except translation.TranslationError as e:
-                yield status(str(e))
+                yield status(str(e), f"**✗ Rechecking** — stopped after "
+                                     f"{time.time() - started:.0f} s.")
                 return
             except Exception as e:
-                yield status(f"Recheck failed: {type(e).__name__}: {e}")
+                yield status(f"Recheck failed: {type(e).__name__}: {e}",
+                             f"**✗ Rechecking** — stopped after {time.time() - started:.0f} s.")
                 return
             # Translator ambiguity notes describe the source, so keep them only
             # while the source is unchanged.
@@ -704,7 +980,7 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
                          "ambiguities_md": ambiguities_md, "displays": displays}
             yield (displays["back"], displays["findings"], displays["candidate_text"],
                    displays["candidate_back"], displays["candidate_findings"],
-                   _review_status(result), new_state)
+                   _review_status(result), new_state, gr.update())
 
         # Fires only on user edits (.input), not on programmatic updates.
         def mark_stale_fn(source, japanese, context, glossary_text, state):
@@ -744,6 +1020,96 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
                 return gr.update()
             return ("**⚠ Speech uses the current Japanese, which has not been reviewed "
                     "since it changed.**\n\n" + _stale_displays(state)[1])
+
+        def _picture_path(picture):
+            # ImageEditor delivers {"background", "layers", "composite"}; the
+            # composite is the picture as cropped in the browser.
+            if isinstance(picture, dict):
+                return picture.get("composite") or picture.get("background")
+            return picture
+
+        # Both video handlers write only to part C components.
+        def preview_frame_fn(picture, size_label, fit_mode, source):
+            path = _picture_path(picture)
+            if not path:
+                return None, "Add a background picture first."
+            size = video_export.FRAME_SIZES[size_label]
+            sentences = video_export.english_sentences(source)
+            subtitle = video_export.split_for_reading(sentences[0])[0] if sentences \
+                else "(subtitle preview)"
+            try:
+                with tempfile.TemporaryDirectory(prefix="kokoro_preview_") as work:
+                    work = Path(work)
+                    background = video_export.prepare_background(path, size, fit_mode,
+                                                                 work / "bg.png")
+                    frame = video_export.render_preview(background, subtitle, size,
+                                                        work / "preview.png")
+                    from PIL import Image
+                    with Image.open(frame) as opened:
+                        image = opened.copy()
+            except video_export.VideoError as e:
+                return None, str(e)
+            except Exception as e:
+                return None, f"Preview failed: {type(e).__name__}: {e}"
+            return image, f"Preview of the first frame ({size_label}, {fit_mode.split(' ')[0]})."
+
+        def create_video_fn(picture, size_label, fit_mode, source, japanese,
+                            voice_name, dest, speed, state):
+            path = _picture_path(picture)
+            expected = translation.DEST_LANGUAGE_CODES.get(dest)
+            problem = None
+            if not path:
+                problem = "Add a background picture first."
+            elif not source or not source.strip():
+                problem = "The English source text (part B) is empty; it is used for the subtitles."
+            elif not japanese or not japanese.strip():
+                problem = "The Japanese text (part B) is empty; translate first."
+            elif not voice_name:
+                problem = f"No {dest} voice selected in part B."
+            else:
+                try:
+                    if get_language_code_from_voice(voice_name) != expected:
+                        problem = f"Voice {voice_name!r} does not speak {dest}. Choose a {dest} voice."
+                except ValueError as e:
+                    problem = f"Invalid voice {voice_name!r}: {e}"
+            if problem:
+                yield None, problem
+                return
+
+            size = video_export.FRAME_SIZES[size_label]
+            try:
+                video_export.ffmpeg_available()
+                yield gr.update(), "Generating Japanese speech sentence by sentence..."
+                clips, spans, _ = synthesize_sentences(voice_name, japanese, speed)
+                cues, pauses, method, detail = video_export.build_timeline(source, spans)
+                yield gr.update(), "Encoding video..."
+                DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                enforce_output_retention()
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                out_path = DEFAULT_OUTPUT_DIR / f"tts_video_{timestamp}_{uuid.uuid4().hex}.mp4"
+                with tempfile.TemporaryDirectory(prefix="kokoro_video_in_") as work:
+                    work = Path(work)
+                    audio = video_export.assemble_audio(clips, pauses, SAMPLE_RATE)
+                    sf.write(work / "speech.wav", audio, SAMPLE_RATE)
+                    background = video_export.prepare_background(path, size, fit_mode,
+                                                                 work / "bg.png")
+                    video_export.render_video(background, work / "speech.wav",
+                                              video_export.build_ass(cues, size), out_path)
+            except video_export.VideoError as e:
+                yield None, str(e)
+                return
+            except Exception as e:
+                yield None, f"Video failed: {type(e).__name__}: {e}"
+                return
+
+            seconds = len(audio) / SAMPLE_RATE
+            megabytes = out_path.stat().st_size / (1024 * 1024)
+            message = (f"Video created: {seconds:.1f} s, {megabytes:.1f} MB, {size_label}, "
+                       f"{fit_mode.split(' ')[0]}.\nSubtitle timing: {detail}.")
+            if state and state.get("stale"):
+                message += ("\n⚠ The Japanese has changed since its last review in part B "
+                            "(the review is stale).")
+            yield str(out_path), message
 
         # Function to load a preset. Returns gr.update() (leave unchanged)
         # rather than None on the error paths: None is not a valid Slider
@@ -794,40 +1160,116 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
             return (gr.update(choices=preset_names),
                     f"Could not delete preset {name!r}. Check the console for details.")
 
+        def _describe_speech(origin, japanese):
+            text = (japanese or "").strip()
+            if not text:
+                empty = "nothing yet. Translate first."
+                return f"**Will speak:** {empty}", f"**Video will speak:** {empty}"
+            preview = " ".join(text.split())
+            if len(preview) > 70:
+                preview = preview[:70] + "…"
+            label = origin or "Japanese typed into the box"
+            return (f"**Will speak:** {label}  \n「{preview}」",
+                    f"**Video will speak:** {label}  \n「{preview}」")
+
+        def _origin_after(success_prefix, label):
+            """Record where the Japanese came from, only when the action succeeded."""
+            def set_origin(status_message, origin, japanese):
+                if (status_message or "").startswith(success_prefix):
+                    origin = label
+                return (origin, *_describe_speech(origin, japanese))
+            return set_origin
+
+        def edited_origin_fn(origin, japanese):
+            if not origin.startswith("Your edit"):
+                origin = f"Your edit (started from: {origin or 'an empty box'})"
+            return (origin, *_describe_speech(origin, japanese))
+
+        origin_outputs = [speech_origin, speech_source_md, video_source_md]
+
+        # Every button gives visible feedback: on click (without waiting for a
+        # running job, see concurrency below) the button turns into a
+        # disabled busy label, its status box says what is running, and a toast
+        # confirms the start; when the work ends the button is restored and a
+        # Success or Warning toast reports the outcome from the status box.
+        def _with_feedback(button, busy_label, started, status_box, success_prefix, **listener):
+            idle_label = button.value
+
+            def begin():
+                gr.Info(started, duration=4)
+                return gr.update(value=busy_label, interactive=False), f"⏳ {started}"
+
+            def finish(message):
+                text = (message or "").strip()
+                first = text.splitlines()[0] if text else ""
+                notes = [line[2:] for line in text.splitlines()[1:] if line.startswith("- ")]
+                if first.startswith(success_prefix) and notes:
+                    # Done, but with caveats (e.g. audio cut short): never a green toast.
+                    gr.Warning(f"{first}<br>" + "<br>".join(notes[:3]), duration=12)
+                elif first.startswith(success_prefix):
+                    gr.Success(first, duration=5)
+                elif first.startswith("⏳"):
+                    # The handler never ran (e.g. gradio rejected an input).
+                    gr.Warning(f"{idle_label} did not complete: the request was rejected "
+                               "before it started.", duration=10)
+                else:
+                    gr.Warning(text[:300] or f"{idle_label} did not complete.", duration=10)
+                return gr.update(value=idle_label, interactive=True)
+
+            # Toasts are only delivered to queued events, so begin/finish are
+            # queued; concurrency_limit=None keeps them from waiting behind a
+            # long job, so the feedback is still immediate.
+            return (button.click(fn=begin, outputs=[button, status_box],
+                                 concurrency_limit=None, show_progress="hidden")
+                    .then(**listener)
+                    .then(fn=finish, inputs=[status_box], outputs=[button],
+                          concurrency_limit=None, show_progress="hidden"))
+
         # Connect the buttons to their functions
-        load_preset.click(
+        _with_feedback(
+            load_preset, "⏳ Loading...", "Loading preset...", status, "Loaded preset",
             fn=load_preset_fn,
             inputs=preset_dropdown,
             outputs=[voice, text, format, speed, status]
         )
 
-        save_preset.click(
+        _with_feedback(
+            save_preset, "⏳ Saving...", "Saving preset...", status, "Saved preset",
             fn=save_preset_fn,
             inputs=[preset_name, voice, text, format, speed],
             outputs=[preset_dropdown, status]
         )
 
-        delete_preset.click(
+        _with_feedback(
+            delete_preset, "⏳ Deleting...", "Deleting preset...", status, "Deleted preset",
             fn=delete_preset_fn,
             inputs=preset_dropdown,
             outputs=[preset_dropdown, status]
         )
 
         # Connect the generate button
-        generate.click(
+        _with_feedback(
+            generate, "⏳ Generating speech...", "Generating speech...", status, "Generated",
             fn=generate_tts_with_logs,
             inputs=[voice, text, format, speed],
             outputs=[output, status]
         )
 
-        translate_btn.click(
+        _with_feedback(
+            translate_btn, "⏳ Translating...", "Translating...", translation_status, "Translated",
             fn=translate_fn,
             inputs=[source_text, source_lang, dest_lang],
             outputs=[translated_text, translation_status]
+        ).then(
+            fn=_origin_after("Translated", "Plain translation (Translate button, not reviewed)"),
+            inputs=[translation_status, speech_origin, translated_text],
+            outputs=origin_outputs, queue=False, show_progress="hidden"
         )
 
         # Format and speed are shared with the direct TTS controls.
-        speak_translation_btn.click(
+        _with_feedback(
+            speak_translation_btn, "⏳ Generating speech...", "Generating speech from the translation...",
+            translation_status, "Generated",
             fn=speak_translation_fn,
             inputs=[translation_voice, translated_text, dest_lang, format, speed],
             outputs=[translated_output, translation_status]
@@ -836,16 +1278,25 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
         review_display_outputs = [back_translation_box, review_findings_md, candidate_text,
                                   candidate_back, candidate_findings_md]
 
-        translate_review_btn.click(
+        _with_feedback(
+            translate_review_btn, "⏳ Translating and reviewing...",
+            "Translating and reviewing (this can take a minute)...", translation_status, "Review done",
             fn=translate_review_fn,
             inputs=[source_text, review_context, review_glossary, review_state],
-            outputs=[translated_text, *review_display_outputs, translation_status, review_state]
+            outputs=[translated_text, *review_display_outputs, translation_status, review_state,
+                     review_progress_md]
+        ).then(
+            fn=_origin_after("Review done", "**Unrevised** translation (from Translate and Review)"),
+            inputs=[translation_status, speech_origin, translated_text],
+            outputs=origin_outputs, queue=False, show_progress="hidden"
         )
 
-        recheck_btn.click(
+        _with_feedback(
+            recheck_btn, "⏳ Rechecking...", "Rechecking the edited translation...",
+            translation_status, "Review done",
             fn=recheck_fn,
             inputs=[source_text, translated_text, review_context, review_glossary, review_state],
-            outputs=[*review_display_outputs, translation_status, review_state]
+            outputs=[*review_display_outputs, translation_status, review_state, review_progress_md]
         )
 
         for edited in (translated_text, source_text, review_context, review_glossary):
@@ -856,18 +1307,50 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
                          candidate_findings_md, review_state]
             )
 
-        use_revised_btn.click(
+        _with_feedback(
+            use_revised_btn, "⏳ Applying...", "Using the revised version...",
+            translation_status, "Revised candidate copied",
             fn=use_revised_fn,
             inputs=[candidate_text, translated_text, history_state, review_state],
             outputs=[translated_text, history_state, history_md, back_translation_box,
                      review_findings_md, candidate_back, candidate_findings_md, review_state,
                      translation_status]
+        ).then(
+            fn=_origin_after("Revised candidate copied",
+                             "**Revised** candidate (applied with Use revised version)"),
+            inputs=[translation_status, speech_origin, translated_text],
+            outputs=origin_outputs, queue=False, show_progress="hidden"
+        )
+
+        # Typing in the Japanese box makes it the user's own version.
+        translated_text.input(
+            fn=edited_origin_fn,
+            inputs=[speech_origin, translated_text],
+            outputs=origin_outputs, queue=False, show_progress="hidden"
         )
 
         speak_translation_btn.click(
             fn=speak_stale_reminder_fn,
             inputs=[review_state],
             outputs=[review_findings_md]
+        )
+
+        _with_feedback(
+            preview_btn, "⏳ Rendering preview...", "Rendering a preview frame...",
+            video_status, "Preview of",
+            fn=preview_frame_fn,
+            inputs=[video_picture, video_size, video_fit, source_text],
+            outputs=[video_preview, video_status]
+        )
+
+        # review_state is read only, to report a stale review; never written.
+        _with_feedback(
+            create_video_btn, "⏳ Creating video...", "Creating the video (speech, then encoding)...",
+            video_status, "Video created",
+            fn=create_video_fn,
+            inputs=[video_picture, video_size, video_fit, source_text, translated_text,
+                    translation_voice, dest_lang, speed, review_state],
+            outputs=[video_output, video_status]
         )
 
     # Bound the queue: gradio defaults to max_size=None (unlimited backlog)
@@ -882,11 +1365,6 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
         share=False
     )
     supported = inspect.signature(interface.launch).parameters
-    if "max_file_size" in supported:
-        # The app declares no file components, but gradio registers
-        # POST /gradio_api/upload unconditionally; without a cap a
-        # credentialed client can stream unbounded bytes into /tmp.
-        launch_kwargs["max_file_size"] = "5mb"
     if "strict_cors" in supported:
         # Tighten the framework's permissive origin reflection where the
         # installed gradio supports it (the any-origin echo with

@@ -28,8 +28,11 @@ DEST_LANGUAGE_CODES: Dict[str, str] = {
 SOURCE_LANGUAGES = sorted({src for src, _ in SUPPORTED_PAIRS})
 DEST_LANGUAGES = sorted({dst for _, dst in SUPPORTED_PAIRS})
 
-MAX_TRANSLATE_CHARS = 5000
+MAX_TRANSLATE_CHARS = None  # None = unlimited (dxb, 2026-10-12); upstream-style cap was 5000
 MAX_NEW_TOKENS = 512
+# The Marian models take at most 512 tokens per input and truncate the rest,
+# so longer sentences are split at clause boundaries before translating.
+MAX_PIECE_CHARS = 300
 BATCH_SIZE = 16
 
 # A file that only exists once a model snapshot is fully usable.
@@ -138,7 +141,7 @@ def translate(text: str, source: str, dest: str) -> str:
     """Translate text, preserving line breaks so speech segmentation matches."""
     if not text or not text.strip():
         raise TranslationError("Enter text to translate.")
-    if len(text) > MAX_TRANSLATE_CHARS:
+    if MAX_TRANSLATE_CHARS is not None and len(text) > MAX_TRANSLATE_CHARS:
         raise TranslationError(
             f"Text is {len(text)} characters; the translation limit is "
             f"{MAX_TRANSLATE_CHARS}."
@@ -155,7 +158,7 @@ def translate(text: str, source: str, dest: str) -> str:
     sentences = []
     layout = []
     for line in lines:
-        parts = [p for p in _SENTENCE_SPLIT.split(line.strip()) if p]
+        parts = _model_pieces([p for p in _SENTENCE_SPLIT.split(line.strip()) if p])
         layout.append(len(parts))
         sentences.extend(parts)
 
@@ -204,6 +207,33 @@ def _split_sentences(line: str, lang: str):
     return [p for p in pattern.split(line.strip()) if p]
 
 
+_CLAUSE_SPLIT = re.compile(r"(?<=[,;:、，；：])\s*")
+
+
+def _model_pieces(sentences):
+    """Split sentences longer than the model can take at clause boundaries
+    (then at a fixed length), so the translation model never truncates."""
+    pieces = []
+    for sentence in sentences:
+        if len(sentence) <= MAX_PIECE_CHARS:
+            pieces.append(sentence)
+            continue
+        current = ""
+        for clause in (c for c in _CLAUSE_SPLIT.split(sentence) if c):
+            if current and len(current) + len(clause) > MAX_PIECE_CHARS:
+                pieces.append(current.strip())
+                current = ""
+            # The split consumed the space after "," but not after "、".
+            separator = " " if current and current[-1:].isascii() else ""
+            current += separator + clause
+            while len(current) > MAX_PIECE_CHARS:  # no clause breaks at all
+                pieces.append(current[:MAX_PIECE_CHARS])
+                current = current[MAX_PIECE_CHARS:]
+        if current.strip():
+            pieces.append(current.strip())
+    return pieces
+
+
 def is_back_model_loaded(source: str = "Japanese", dest: str = "English") -> bool:
     return BACK_TRANSLATION_PAIRS.get((source, dest)) in _models
 
@@ -221,7 +251,7 @@ def back_translate(text: str, source: str = "Japanese", dest: str = "English") -
     """
     if not text or not text.strip():
         raise TranslationError("There is no text to back-translate.")
-    if len(text) > MAX_TRANSLATE_CHARS:
+    if MAX_TRANSLATE_CHARS is not None and len(text) > MAX_TRANSLATE_CHARS:
         raise TranslationError(
             f"Text is {len(text)} characters; the back-translation limit is "
             f"{MAX_TRANSLATE_CHARS}."
@@ -235,7 +265,7 @@ def back_translate(text: str, source: str = "Japanese", dest: str = "English") -
     layout = []
     sentences = []
     for line in text.split("\n"):
-        parts = _split_sentences(line, source)
+        parts = _model_pieces(_split_sentences(line, source))
         layout.append(len(parts))
         sentences.extend(parts)
 

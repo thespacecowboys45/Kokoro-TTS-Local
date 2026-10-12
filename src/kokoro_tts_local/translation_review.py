@@ -19,8 +19,13 @@ from .translation import TranslationError, back_translate
 OLLAMA_URL = os.environ.get("KOKORO_REVIEW_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
 REVIEW_MODEL = os.environ.get("KOKORO_REVIEW_MODEL", "qwen2.5:7b")
 MAX_REVISION_PASSES = 2
-REQUEST_TIMEOUT = 300
-MAX_REVIEW_CHARS = 5000
+# None = unlimited (dxb, 2026-10-12: long jobs may run as long as they need).
+REQUEST_TIMEOUT = None        # was 300 s
+MAX_REVIEW_CHARS = None       # was 5000
+# Ollama's default context window is a few thousand tokens and silently drops
+# the start of longer prompts, so it is sized to each prompt (qwen2.5: 32k max).
+MIN_CONTEXT_TOKENS = 4096
+MAX_CONTEXT_TOKENS = 32768
 
 CATEGORIES = [
     "omitted", "added", "changed_fact_or_number", "changed_negation_or_certainty",
@@ -154,6 +159,26 @@ class ReviewError(TranslationError):
 
 # ---------------------------------------------------------------- LLM access
 
+def _context_size(prompt: str) -> int:
+    """Context window large enough for the prompt plus an answer of similar size.
+
+    Rough token estimate: about one token per Japanese character and one per
+    four Latin characters.
+    """
+    cjk = sum(1 for ch in prompt if ord(ch) > 0x2E7F)
+    estimate = cjk + (len(prompt) - cjk) / 4
+    needed = int(estimate * 2.5) + 1024  # prompt + answer + headroom
+    if needed > MAX_CONTEXT_TOKENS:
+        # The model's hard maximum: Ollama would silently drop the start.
+        raise ReviewError(
+            f"This text is too long for the review model's {MAX_CONTEXT_TOKENS:,}-token "
+            "context (about 12,000 Japanese characters per review). Review it in parts.")
+    size = MIN_CONTEXT_TOKENS
+    while size < needed and size < MAX_CONTEXT_TOKENS:
+        size *= 2
+    return min(size, MAX_CONTEXT_TOKENS)
+
+
 def _chat(system: str, user: str, schema: dict) -> dict:
     payload = json.dumps({
         "model": REVIEW_MODEL,
@@ -161,7 +186,8 @@ def _chat(system: str, user: str, schema: dict) -> dict:
                      {"role": "user", "content": user}],
         "format": schema,
         "stream": False,
-        "options": {"temperature": 0.2},
+        "options": {"temperature": 0.2, "num_ctx": _context_size(system + user),
+                    "num_predict": -1},
     }).encode("utf-8")
     last_problem = None
     for _ in range(2):  # one retry for malformed output
@@ -446,7 +472,8 @@ def run_review(source: str, japanese: str, context: str, glossary) -> Iterator[t
         raise ReviewError("The original English text is empty; there is nothing to compare against.")
     if not japanese or not japanese.strip():
         raise ReviewError("The Japanese text is empty; translate or type it first.")
-    if len(source) > MAX_REVIEW_CHARS or len(japanese) > MAX_REVIEW_CHARS:
+    if MAX_REVIEW_CHARS is not None and (len(source) > MAX_REVIEW_CHARS
+                                         or len(japanese) > MAX_REVIEW_CHARS):
         raise ReviewError(f"Text is too long to review (limit {MAX_REVIEW_CHARS} characters).")
 
     yield "progress", "Back-translating and reviewing the unrevised Japanese..."

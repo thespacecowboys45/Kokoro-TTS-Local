@@ -359,7 +359,14 @@ def _ass_text(text: str) -> str:
     return " ".join(text.split())
 
 
-def build_ass(cues: Sequence[Tuple[float, float, str]], size: Tuple[int, int]) -> str:
+CARD_SECONDS = 1.0
+CARD_TEXT = "Original text next..."
+
+
+def build_ass(cues: Sequence[Tuple[float, float, str]], size: Tuple[int, int],
+              cards: Sequence[Tuple[float, float, str]] = ()) -> str:
+    """Subtitles, plus optional full-frame title cards (black panel, centred
+    text) such as the 'Original text next...' card of a stitched video."""
     width, height = size
     font_size = max(24, round(height * 0.055)) if width >= height else max(24, round(width * 0.06))
     outline = max(2, round(height * 0.004))
@@ -379,12 +386,20 @@ def build_ass(cues: Sequence[Tuple[float, float, str]], size: Tuple[int, int]) -
         "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
         f"Style: Default,Arial,{font_size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,"
         f"0,0,0,0,100,100,0,0,1,{outline},{max(1, outline // 2)},2,{margin_h},{margin_h},{margin_v},1",
+        f"Style: Card,Arial,{round(font_size * 1.3)},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,"
+        f"0,1,0,0,100,100,0,0,1,0,0,5,{margin_h},{margin_h},0,1",
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
     for start, end, text in cues:
-        lines.append(f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Default,,0,0,0,,{_ass_text(text)}")
+        lines.append(f"Dialogue: 2,{_ass_time(start)},{_ass_time(end)},Default,,0,0,0,,{_ass_text(text)}")
+    for start, end, text in cards:
+        # A black panel covering the frame (an ASS drawing), then the text on top.
+        panel = (f"{{\\an7\\pos(0,0)\\p1\\1c&H000000&\\bord0\\shad0}}"
+                 f"m 0 0 l {width} 0 {width} {height} 0 {height}{{\\p0}}")
+        lines.append(f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Card,,0,0,0,,{panel}")
+        lines.append(f"Dialogue: 1,{_ass_time(start)},{_ass_time(end)},Card,,0,0,0,,{_ass_text(text)}")
     return "\n".join(lines) + "\n"
 
 

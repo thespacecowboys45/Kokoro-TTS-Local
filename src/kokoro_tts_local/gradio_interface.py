@@ -51,6 +51,8 @@ from . import speed_dial
 from . import translation
 from . import translation_review
 from . import video_export
+from . import fork_version
+from . import speech_to_text
 
 # Constants
 # Size/resource limits: None means unlimited. This instance is deliberately
@@ -531,7 +533,12 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
 
     # Create interface
     with gr.Blocks(title="Kokoro TTS Generator", fill_height=True) as interface:
-        gr.Markdown("# Kokoro TTS Generator")
+        with gr.Row(equal_height=True):
+            gr.Markdown("# Kokoro TTS Generator", scale=3)
+            # This fork's identity, in the same rounded panel style as the parts.
+            with gr.Column(variant="panel", scale=1, min_width=260):
+                gr.Markdown(f"**FORK:** {fork_version.FORK_NAME}  \n"
+                            f"Version **{fork_version.FORK_VERSION}**")
 
         # Part A: direct text to speech. Built-in panel containers only (no
         # tabs, no custom CSS) so the default theme's look is preserved.
@@ -631,6 +638,15 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
                 placeholder="Enter text to translate...",
                 label="Source Text"
             )
+            # Dictation: speech is transcribed locally (Whisper) and appended to
+            # the Source Text while you speak. Part B only; part A is untouched.
+            source_mic = gr.Audio(
+                sources=["microphone"],
+                streaming=True,
+                type="numpy",
+                label="🎤 Dictate into Source Text (English speech-to-text) — press Record and speak"
+            )
+            dictation_state = gr.State(None)
             with gr.Row():
                 review_context = gr.Textbox(
                     lines=2,
@@ -686,7 +702,8 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
                 history_md = gr.Markdown("None yet.")
 
             gr.Markdown("### 4. Speak the translation\n"
-                        "Uses the Output Format and Speed set in part A.")
+                        "Output Format mirrors part A's (change either one); Speed comes "
+                        "from part A.")
             # Which version of the Japanese will be spoken (plain, unrevised,
             # revised, or the user's edit); kept current as the text changes.
             speech_source_md = gr.Markdown("**Will speak:** nothing yet. Translate first.")
@@ -697,8 +714,37 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
                     label="Translation Voice",
                     scale=2
                 )
+                # A mirror of part A's Output Format: both always hold the same value.
+                format_mirror = gr.Radio(
+                    choices=["wav", "mp3", "aac"],
+                    value="wav",
+                    label="Output Format",
+                    scale=1
+                )
                 speak_translation_btn = gr.Button(
                     "Generate Speech from Translation", variant="primary", scale=1
+                )
+            # Stitching: the part C video continues with the original-language
+            # text, spoken by a second voice, after a 1-second title card.
+            original_voices = [v for v in voices if get_language_code_from_voice(v) in ("a", "b")]
+            stitch_checkbox = gr.Checkbox(
+                label="Stitch original translation",
+                value=False,
+                info="Adds the original English to the part C video, spoken by a second voice, "
+                     "after a 1-second \"Original text next...\" card."
+            )
+            # Same controls, in the same order, as part A's voice and text.
+            with gr.Column(visible=False) as stitch_area:
+                stitch_voice = gr.Dropdown(
+                    choices=original_voices,
+                    value=("af_heart" if "af_heart" in original_voices
+                           else (original_voices[0] if original_voices else None)),
+                    label="Voice"
+                )
+                stitch_text = gr.Textbox(
+                    lines=3,
+                    placeholder="Original (English) text to speak; filled from Source Text.",
+                    label="Text"
                 )
             translated_output = gr.Audio(label="Translated Audio")
             translation_status = gr.Textbox(
@@ -715,6 +761,7 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
                         "Uses the Japanese text and voice from part B (with the Speed from "
                         "part A), and the English source text as subtitles.")
             video_source_md = gr.Markdown("**Video will speak:** nothing yet. Translate first.")
+            stitch_note_md = gr.Markdown("")
             with gr.Row():
                 with gr.Column(scale=2):
                     # image_mode="RGB": gradio re-saves each upload under its
@@ -731,6 +778,9 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
                         eraser=False,
                         layers=False,
                         label="Background picture (drag to crop)"
+                    )
+                    change_picture_btn = gr.UploadButton(
+                        "🖼 Change Picture", file_types=["image"], file_count="single"
                     )
                 with gr.Column(scale=1):
                     video_size = gr.Dropdown(
@@ -1054,7 +1104,8 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
             return image, f"Preview of the first frame ({size_label}, {fit_mode.split(' ')[0]})."
 
         def create_video_fn(picture, size_label, fit_mode, source, japanese,
-                            voice_name, dest, speed, state):
+                            voice_name, dest, speed, state,
+                            stitch=False, stitch_voice_name=None, stitch_source=""):
             path = _picture_path(picture)
             expected = translation.DEST_LANGUAGE_CODES.get(dest)
             problem = None
@@ -1066,12 +1117,19 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
                 problem = "The Japanese text (part B) is empty; translate first."
             elif not voice_name:
                 problem = f"No {dest} voice selected in part B."
+            elif stitch and not (stitch_source or "").strip():
+                problem = "Stitching is on, but its Text (part B step 4) is empty."
+            elif stitch and not stitch_voice_name:
+                problem = "Stitching is on, but no voice is selected for the original text."
             else:
                 try:
                     if get_language_code_from_voice(voice_name) != expected:
                         problem = f"Voice {voice_name!r} does not speak {dest}. Choose a {dest} voice."
+                    elif stitch and get_language_code_from_voice(stitch_voice_name) not in ("a", "b"):
+                        problem = (f"Voice {stitch_voice_name!r} does not speak English. "
+                                   "Choose an English voice for the original text.")
                 except ValueError as e:
-                    problem = f"Invalid voice {voice_name!r}: {e}"
+                    problem = f"Invalid voice: {e}"
             if problem:
                 yield None, problem
                 return
@@ -1082,6 +1140,23 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
                 yield gr.update(), "Generating Japanese speech sentence by sentence..."
                 clips, spans, _ = synthesize_sentences(voice_name, japanese, speed)
                 cues, pauses, method, detail = video_export.build_timeline(source, spans)
+                audio = video_export.assemble_audio(clips, pauses, SAMPLE_RATE)
+                cards = []
+                if stitch:
+                    # Part 2: a title card over silence, then the original text
+                    # spoken by the second voice, with its own timed subtitles.
+                    yield gr.update(), "Generating the original English speech for stitching..."
+                    clips2, spans2, _ = synthesize_sentences(stitch_voice_name, stitch_source, speed)
+                    cues2, pauses2, _, detail2 = video_export.build_timeline(stitch_source, spans2)
+                    card_start = len(audio) / SAMPLE_RATE
+                    part2_start = card_start + video_export.CARD_SECONDS
+                    cards = [(card_start, part2_start, video_export.CARD_TEXT)]
+                    cues = list(cues) + [(s + part2_start, e + part2_start, t) for s, e, t in cues2]
+                    audio = np.concatenate([
+                        audio,
+                        np.zeros(int(round(video_export.CARD_SECONDS * SAMPLE_RATE)), dtype=np.float32),
+                        video_export.assemble_audio(clips2, pauses2, SAMPLE_RATE),
+                    ])
                 yield gr.update(), "Encoding video..."
                 DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
                 enforce_output_retention()
@@ -1089,12 +1164,11 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
                 out_path = DEFAULT_OUTPUT_DIR / f"tts_video_{timestamp}_{uuid.uuid4().hex}.mp4"
                 with tempfile.TemporaryDirectory(prefix="kokoro_video_in_") as work:
                     work = Path(work)
-                    audio = video_export.assemble_audio(clips, pauses, SAMPLE_RATE)
                     sf.write(work / "speech.wav", audio, SAMPLE_RATE)
                     background = video_export.prepare_background(path, size, fit_mode,
                                                                  work / "bg.png")
                     video_export.render_video(background, work / "speech.wav",
-                                              video_export.build_ass(cues, size), out_path)
+                                              video_export.build_ass(cues, size, cards), out_path)
             except video_export.VideoError as e:
                 yield None, str(e)
                 return
@@ -1106,6 +1180,10 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
             megabytes = out_path.stat().st_size / (1024 * 1024)
             message = (f"Video created: {seconds:.1f} s, {megabytes:.1f} MB, {size_label}, "
                        f"{fit_mode.split(' ')[0]}.\nSubtitle timing: {detail}.")
+            if stitch:
+                message += (f"\nStitched: \"{video_export.CARD_TEXT}\" card at {card_start:.1f} s, "
+                            f"then the original English ({stitch_voice_name}) from "
+                            f"{part2_start:.1f} s; its subtitle timing: {detail2}.")
             if state and state.get("stale"):
                 message += ("\n⚠ The Japanese has changed since its last review in part B "
                             "(the review is stale).")
@@ -1186,6 +1264,57 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
             return (origin, *_describe_speech(origin, japanese))
 
         origin_outputs = [speech_origin, speech_source_md, video_source_md]
+
+        # Dictation into part B's Source Text.
+        def dictation_start_fn(source):
+            try:
+                if not speech_to_text.is_loaded():
+                    gr.Info("Loading the speech-to-text model (first use can take a minute)...")
+                    speech_to_text._load()
+            except speech_to_text.SpeechToTextError as e:
+                gr.Warning(str(e))
+                return None, str(e)
+            gr.Info("🎤 Listening: speak now. Your words are added to Source Text as you talk.")
+            return (speech_to_text.Dictation(source),
+                    "🎤 Listening... speak now; text appears in Source Text after each pause.")
+
+        def dictation_stream_fn(chunk, state, source):
+            if chunk is None:
+                return gr.update(), state
+            if state is None:  # a chunk that arrived without (or after) start
+                state = speech_to_text.Dictation(source)
+            sample_rate, audio = chunk
+            try:
+                return state.feed(sample_rate, audio), state
+            except speech_to_text.SpeechToTextError as e:
+                gr.Warning(str(e))
+                return gr.update(), state
+
+        def dictation_stop_fn(state):
+            if state is None:
+                return gr.update(), None, "Dictation stopped."
+            try:
+                text = state.finish()
+            except speech_to_text.SpeechToTextError as e:
+                gr.Warning(str(e))
+                return gr.update(), None, str(e)
+            words = state.dictated_words()
+            if words:
+                gr.Success(f"Dictation added {words} word(s) to Source Text.")
+            else:
+                gr.Warning("No speech was recognised. Check the microphone and try again.")
+            return text, None, f"Dictation finished: {words} word(s) added to Source Text."
+
+        def _mirror(value):
+            return value
+
+        def change_picture_fn(uploaded):
+            path = uploaded if isinstance(uploaded, str) else getattr(uploaded, "name", None)
+            if not path:
+                return gr.update(), gr.update(), "No picture was chosen."
+            gr.Info("Picture replaced.")
+            return ({"background": path, "layers": [], "composite": path}, None,
+                    "Picture replaced. Use Preview Frame or Create Video with the new picture.")
 
         # Every button gives visible feedback: on click (without waiting for a
         # running job, see concurrency below) the button turns into a
@@ -1335,6 +1464,69 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
             outputs=[review_findings_md]
         )
 
+        source_mic.start_recording(
+            fn=dictation_start_fn,
+            inputs=[source_text],
+            outputs=[dictation_state, translation_status]
+        )
+        source_mic.stream(
+            fn=dictation_stream_fn,
+            inputs=[source_mic, dictation_state, source_text],
+            outputs=[source_text, dictation_state],
+            stream_every=1.0, time_limit=None, show_progress="hidden"
+        )
+        # Dictated text changes the source, so an existing review becomes stale.
+        source_mic.stop_recording(
+            fn=dictation_stop_fn,
+            inputs=[dictation_state],
+            outputs=[source_text, dictation_state, translation_status]
+        ).then(
+            fn=mark_stale_fn,
+            inputs=[source_text, translated_text, review_context, review_glossary, review_state],
+            outputs=[back_translation_box, review_findings_md, candidate_back,
+                     candidate_findings_md, review_state]
+        )
+
+        # Part A's Output Format and part B's mirror always hold the same value.
+        # A -> B on any change (including Load preset); B -> A on user input only,
+        # so the pair can never loop.
+        format.change(fn=_mirror, inputs=format, outputs=format_mirror,
+                      queue=False, show_progress="hidden")
+        format_mirror.input(fn=_mirror, inputs=format_mirror, outputs=format,
+                            queue=False, show_progress="hidden")
+
+        change_picture_btn.upload(
+            fn=change_picture_fn,
+            inputs=change_picture_btn,
+            outputs=[video_picture, video_preview, video_status]
+        )
+
+        def _stitch_note(checked, voice_name):
+            if not checked:
+                return ""
+            return (f"**Stitched video:** after the Japanese part, a 1-second "
+                    f"\"{video_export.CARD_TEXT}\" card, then the original English spoken by "
+                    f"**{voice_name or 'the selected voice'}** (part B step 4), on the same picture.")
+
+        def stitch_toggle_fn(checked, text_now, source):
+            # Prefill the original text from Source Text when it is still empty.
+            fill = text_now if (text_now or "").strip() else (source or "")
+            return gr.update(visible=checked), fill
+
+        stitch_checkbox.change(
+            fn=stitch_toggle_fn,
+            inputs=[stitch_checkbox, stitch_text, source_text],
+            outputs=[stitch_area, stitch_text],
+            queue=False, show_progress="hidden"
+        ).then(
+            fn=_stitch_note, inputs=[stitch_checkbox, stitch_voice], outputs=stitch_note_md,
+            queue=False, show_progress="hidden"
+        )
+        stitch_voice.change(
+            fn=_stitch_note, inputs=[stitch_checkbox, stitch_voice], outputs=stitch_note_md,
+            queue=False, show_progress="hidden"
+        )
+
         _with_feedback(
             preview_btn, "⏳ Rendering preview...", "Rendering a preview frame...",
             video_status, "Preview of",
@@ -1349,7 +1541,8 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
             video_status, "Video created",
             fn=create_video_fn,
             inputs=[video_picture, video_size, video_fit, source_text, translated_text,
-                    translation_voice, dest_lang, speed, review_state],
+                    translation_voice, dest_lang, speed, review_state,
+                    stitch_checkbox, stitch_voice, stitch_text],
             outputs=[video_output, video_status]
         )
 

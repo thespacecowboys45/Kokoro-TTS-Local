@@ -38,3 +38,11 @@ voices/
 voices/*.pt
 voices/**/*.pt
 config.json
+
+# dxb project specific
+output/
+outputs/
+generate_bella_line.py
+generate_campaign_voices.py
+generate_final_opener_candidate.py
+generate_question_inflection_variants.py

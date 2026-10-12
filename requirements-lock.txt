@@ -359,6 +359,8 @@ segments==2.4.0
     # via phonemizer-fork
 semantic-version==2.10.0
     # via gradio
+sentencepiece==0.2.2
+    # via -r requirements.txt
 setuptools==84.0.0
     # via
     #   -r requirements.txt

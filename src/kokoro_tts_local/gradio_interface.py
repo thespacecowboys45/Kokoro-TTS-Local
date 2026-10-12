@@ -43,6 +43,7 @@ from .models import (
     get_base_dir
 )
 from . import speed_dial
+from . import translation
 
 # Constants
 MAX_TEXT_LENGTH = 5000
@@ -461,6 +462,92 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
                 interactive=False
             )
 
+        # Translation section. It has its own player and status box so the
+        # direct TTS workflow above is never written to by these handlers.
+        default_dest = translation.DEST_LANGUAGES[0]
+        translation_voices = [
+            v for v in voices
+            if get_language_code_from_voice(v) == translation.DEST_LANGUAGE_CODES[default_dest]
+        ]
+
+        gr.Markdown("## Translate & Speak")
+
+        with gr.Row():
+            source_lang = gr.Dropdown(
+                choices=translation.SOURCE_LANGUAGES,
+                value=translation.SOURCE_LANGUAGES[0],
+                label="Source Language",
+                interactive=True
+            )
+            dest_lang = gr.Dropdown(
+                choices=translation.DEST_LANGUAGES,
+                value=default_dest,
+                label="Destination Language",
+                interactive=True
+            )
+
+        source_text = gr.Textbox(
+            lines=3,
+            placeholder="Enter text to translate...",
+            label="Source Text"
+        )
+        translate_btn = gr.Button("Translate")
+        translated_text = gr.Textbox(
+            lines=3,
+            placeholder="Translated text appears here. Review or edit it before generating speech.",
+            label="Translated Text",
+            interactive=True
+        )
+        translation_voice = gr.Dropdown(
+            choices=translation_voices,
+            value=translation_voices[0] if translation_voices else None,
+            label="Translation Voice"
+        )
+        speak_translation_btn = gr.Button("Generate Speech from Translation")
+        translated_output = gr.Audio(label="Translated Audio")
+        translation_status = gr.Textbox(
+            label="Translation Status",
+            value="Ready.",
+            lines=3,
+            interactive=False
+        )
+
+        # Generator so the first, slow model load is announced before it starts.
+        def translate_fn(text, source, dest):
+            if not translation.is_model_loaded(source, dest):
+                if translation.is_model_downloaded(source, dest):
+                    yield gr.update(), "Loading translation model..."
+                else:
+                    yield gr.update(), "Downloading translation model (first use only)..."
+            try:
+                result = translation.translate(text, source, dest)
+            except translation.TranslationError as e:
+                yield gr.update(), str(e)
+                return
+            except Exception as e:
+                yield gr.update(), f"Translation failed: {type(e).__name__}: {e}"
+                return
+            yield result, f"Translated {len(text)} character(s) {source} → {dest}."
+
+        # Never falls back to another voice or language: a voice that does not
+        # speak the destination language is rejected before any synthesis.
+        def speak_translation_fn(voice_name, text, dest, format, speed):
+            expected = translation.DEST_LANGUAGE_CODES.get(dest)
+            if expected is None:
+                return None, f"Speech is not supported for destination language {dest!r}."
+            if not voice_name:
+                return None, f"No {dest} voice selected. Install a {dest} voice and restart."
+            try:
+                voice_lang = get_language_code_from_voice(voice_name)
+            except ValueError as e:
+                return None, f"Invalid voice {voice_name!r}: {e}"
+            if voice_lang != expected:
+                return None, (f"Voice {voice_name!r} does not speak {dest}. "
+                              f"Choose a {dest} voice.")
+            if not text or not text.strip():
+                return None, "Translate some text (or type it) before generating speech."
+            return generate_tts_with_logs(voice_name, text, format, speed)
+
         # Function to load a preset. Returns gr.update() (leave unchanged)
         # rather than None on the error paths: None is not a valid Slider
         # value and would send speed=None into the pipeline on the next run.
@@ -534,6 +621,19 @@ def create_interface(server_name="127.0.0.1", server_port=7860, auth=None):
             fn=generate_tts_with_logs,
             inputs=[voice, text, format, speed],
             outputs=[output, status]
+        )
+
+        translate_btn.click(
+            fn=translate_fn,
+            inputs=[source_text, source_lang, dest_lang],
+            outputs=[translated_text, translation_status]
+        )
+
+        # Format and speed are shared with the direct TTS controls.
+        speak_translation_btn.click(
+            fn=speak_translation_fn,
+            inputs=[translation_voice, translated_text, dest_lang, format, speed],
+            outputs=[translated_output, translation_status]
         )
 
     # Bound the queue: gradio defaults to max_size=None (unlimited backlog)

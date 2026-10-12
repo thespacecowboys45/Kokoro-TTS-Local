@@ -43,6 +43,7 @@ dependencies = [
     "ordered-set",
     "pypinyin",
     "pypinyin-dict",
+    "sentencepiece",
 ]
 
 [project.urls]

@@ -34,6 +34,9 @@ ordered-set
 pypinyin
 pypinyin-dict
 
+# Translation (English→Japanese)
+sentencepiece  # Tokenizer for the local English→Japanese translation model
+
 # Note: mishkal-hebrew was removed because all its releases were deleted from
 # PyPI (the project was renamed to "phonikud"), which broke installation on
 # every Python version. Nothing in this repo imports it.

@@ -38,6 +38,7 @@ voices/
 voices/*.pt
 voices/**/*.pt
 config.json
+translation_models/
 
 # dxb project specific
 output/
